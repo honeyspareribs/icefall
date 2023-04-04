@@ -7,7 +7,9 @@ set -eou pipefail
 
 nj=30
 stage=0
-stop_stage=5
+stop_stage=100
+
+num_splits=10
 
 # We assume dl_dir (download dir) contains the following
 # directories and files. If not, you need to apply aishell2 through
@@ -26,6 +28,7 @@ stop_stage=5
 #     - speech
 
 dl_dir=$PWD/download
+lang_char_dir=data/lang_char
 
 . shared/parse_options.sh || exit 1
 
@@ -98,34 +101,64 @@ if [ $stage -le 2 ] && [ $stop_stage -ge 2 ]; then
 fi
 
 if [ $stage -le 3 ] && [ $stop_stage -ge 3 ]; then
-  log "Stage 3: Compute fbank for aishell2"
-  if [ ! -f data/fbank/.aishell2.done ]; then
-    mkdir -p data/fbank
-    ./local/compute_fbank_aishell2.py
-    touch data/fbank/.aishell2.done
+  log "Stage 3: Preprocess aishell2 manifest"
+  if [ ! -f data/fbank/.preprocess_complete ]; then
+    python3 ./local/preprocess_aishell2.py
+    touch data/fbank/.preprocess_complete
   fi
 fi
 
 if [ $stage -le 4 ] && [ $stop_stage -ge 4 ]; then
-  log "Stage 4: Compute fbank for musan"
-  if [ ! -f data/fbank/.msuan.done ]; then
-    mkdir -p data/fbank
-    ./local/compute_fbank_musan.py
-    touch data/fbank/.msuan.done
+  log "Stage 4: Compute features for DEV and TEST subsets of aishell2"
+  python3 ./local/compute_fbank_aishell2_dev_test.py
+fi
+
+if [ $stage -le 5 ] && [ $stop_stage -ge 5 ]; then
+  log "Stage 5: Split train subset into ${num_splits} pieces"
+  split_dir=data/fbank/train_split_${num_splits}
+  if [ ! -f $split_dir/.split_completed ]; then
+    lhotse split $num_splits ./data/fbank/aishell2_cuts_train_raw.jsonl.gz $split_dir
+    touch $split_dir/.split_completed
   fi
 fi
 
-lang_char_dir=data/lang_char
-if [ $stage -le 5 ] && [ $stop_stage -ge 5 ]; then
-  log "Stage 5: Prepare char based lang"
+if [ $stage -le 6 ] && [ $stop_stage -ge 6 ]; then
+  log "Stage 6: Compute features for train"
+  ./local/compute_fbank_aishell2_splits.py \
+    --training-subset train \
+    --num-workers 2 \
+    --batch-duration 1000 \
+    --start 7 \
+    --num-splits $num_splits
+fi
+
+if [ $stage -le 7 ] && [ $stop_stage -ge 7 ]; then
+  log "Stage 11: Combine features for train"
+  if [ ! -f data/fbank/cuts_train.jsonl.gz ]; then
+    pieces=$(find data/fbank/train_split_${num_splits} -name "cuts_train.*.jsonl.gz")
+    lhotse combine $pieces data/fbank/aishell2_cuts_train.jsonl.gz
+  fi
+fi
+
+if [ $stage -le 8 ] && [ $stop_stage -ge 8 ]; then
+  log "Stage 14: Compute fbank for musan"
+  mkdir -p data/fbank
+  ./local/compute_fbank_musan.py
+fi
+
+if [ $stage -le 9 ] && [ $stop_stage -ge 9 ]; then
+  log "Stage 9: Prepare char based lang"
   mkdir -p $lang_char_dir
 
-  # Prepare text.
-  # Note: in Linux, you can install jq with the following command:
-  # 1. wget -O jq https://github.com/stedolan/jq/releases/download/jq-1.6/jq-linux64
-  # 2. chmod +x ./jq
-  # 3. cp jq /usr/bin
-  if [ ! -f $lang_char_dir/text ]; then
+  if ! which jq; then
+      echo "This script is intended to be used with jq but you have not installed jq
+      Note: in Linux, you can install jq with the following command:
+      1. wget -O jq https://github.com/stedolan/jq/releases/download/jq-1.6/jq-linux64
+      2. chmod +x ./jq
+      3. cp jq /usr/bin" && exit 1
+  fi
+  if [ ! -f $lang_char_dir/text ] || [ ! -s $lang_char_dir/text ]; then
+    log "Prepare text."
     gunzip -c data/manifests/aishell2_supervisions_train.jsonl.gz \
       | jq '.text' | sed 's/"//g' \
       | ./local/text2token.py -t "char" > $lang_char_dir/text
@@ -133,10 +166,9 @@ if [ $stage -le 5 ] && [ $stop_stage -ge 5 ]; then
 
   # The implementation of chinese word segmentation for text,
   # and it will take about 15 minutes.
-  # If you can't install paddle-tiny with python 3.8, please refer to
-  # https://github.com/fxsjy/jieba/issues/920
   if [ ! -f $lang_char_dir/text_words_segmentation ]; then
     python3 ./local/text2segments.py \
+      --num-process $nj \
       --input-file $lang_char_dir/text \
       --output-file $lang_char_dir/text_words_segmentation
   fi
@@ -149,36 +181,13 @@ if [ $stage -le 5 ] && [ $stop_stage -ge 5 ]; then
       --input-file $lang_char_dir/words_no_ids.txt \
       --output-file $lang_char_dir/words.txt
   fi
+fi
 
-  if [ ! -f $lang_char_dir/L_disambig.pt ]; then
-    python3 ./local/prepare_char.py
+if [ $stage -le 10 ] && [ $stop_stage -ge 10 ]; then
+  log "Stage 10: Prepare char based L_disambig.pt"
+  if [ ! -f data/lang_char/L_disambig.pt ]; then
+    python3 ./local/prepare_char.py \
+      --lang-dir data/lang_char
   fi
 fi
 
-if [ $stage -le 6 ] && [ $stop_stage -ge 6 ]; then
-  log "Stage 6: Prepare G"
-  # We assume you have install kaldilm, if not, please install
-  # it using: pip install kaldilm
-
-  if [ ! -f ${lang_char_dir}/3-gram.unpruned.arpa ]; then
-    ./shared/make_kn_lm.py \
-      -ngram-order 3 \
-      -text $lang_char_dir/text_words_segmentation \
-      -lm $lang_char_dir/3-gram.unpruned.arpa
-  fi
-
-  mkdir -p data/lm
-  if [ ! -f data/lm/G_3_gram.fst.txt ]; then
-    # It is used in building LG
-    python3 -m kaldilm \
-      --read-symbol-table="$lang_char_dir/words.txt" \
-      --disambig-symbol='#0' \
-      --max-order=3 \
-      $lang_char_dir/3-gram.unpruned.arpa > data/lm/G_3_gram.fst.txt
-  fi
-fi
-
-if [ $stage -le 7 ] && [ $stop_stage -ge 7 ]; then
-  log "Stage 7: Compile LG"
-  ./local/compile_lg.py --lang-dir $lang_char_dir
-fi
