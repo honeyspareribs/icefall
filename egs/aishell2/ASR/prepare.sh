@@ -128,7 +128,7 @@ if [ $stage -le 6 ] && [ $stop_stage -ge 6 ]; then
     --training-subset train \
     --num-workers 2 \
     --batch-duration 1000 \
-    --start 7 \
+    --start 0 \
     --num-splits $num_splits
 fi
 
