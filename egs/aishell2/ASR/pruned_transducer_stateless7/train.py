@@ -691,7 +691,28 @@ def compute_loss(
             prune_range=params.prune_range,
             am_scale=params.am_scale,
             lm_scale=params.lm_scale,
+            reduction="none"
         )
+        simple_loss_is_finite = torch.isfinite(simple_loss)
+        pruned_loss_is_finite = torch.isfinite(pruned_loss)
+        is_finite = simple_loss_is_finite & pruned_loss_is_finite
+        if not torch.all(is_finite):
+            logging.info(
+                "Not all losses are finite!\n"
+                f"simple_loss: {simple_loss}\n"
+                f"pruned_loss: {pruned_loss}\n"
+            )
+            display_and_save_batch(batch, params=params, graph_compiler=graph_compiler)
+            simple_loss = simple_loss[simple_loss_is_finite]
+            pruned_loss = pruned_loss[pruned_loss_is_finite]
+            if feature.size(0) >= 10:
+                if torch.all(~simple_loss_is_finite) or torch.all(~pruned_loss_is_finite):
+                    raise ValueError(
+                        "There are too many utterances in this batch "
+                        "leading to inf or nan losses."
+                    )
+        simple_loss = simple_loss.sum()
+        pruned_loss = pruned_loss.sum()
 
         s = params.simple_loss_scale
         # take down the scale on the simple loss from 1.0 at the start
